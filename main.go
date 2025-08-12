@@ -4,44 +4,34 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/raisfordiner/wattching/pkg/cpuinfo"
 	"github.com/raisfordiner/wattching/pkg/msr"
+	"github.com/raisfordiner/wattching/pkg/tui"
 )
 
-// unit_msr_t structure from the C code
 type unitMSR struct {
-	Power  uint8 // bits 0-3
 	Energy uint8 // bits 8-12
-	Time   uint8 // bits 16-19
 }
 
 type powerDomain struct {
-	name         string
-	msrOffset    int64
-	lastEnergy   uint64
-	hasDomain    bool
-	currentPower float64
+	name       string
+	msrOffset  int64
+	lastEnergy uint64
+	hasDomain  bool
 }
 
 func parseUnitMSR(data uint64) unitMSR {
 	return unitMSR{
-		Power:  uint8(data & 0xF),
 		Energy: uint8((data >> 8) & 0x1F),
-		Time:   uint8((data >> 16) & 0xF),
 	}
 }
 
 func main() {
-	log.Println("Starting Wattching...")
-
-	// Display CPU Info
-	cpu := cpuinfo.GetCPUInfo()
-	fmt.Println("--- CPU Information ---")
-	fmt.Printf("Vendor: %s\n", cpu.VendorString)
-	fmt.Printf("Model:  %s\n", cpu.BrandString)
-	fmt.Println("-----------------------")
+	cpuInfo := cpuinfo.GetCPUInfo()
 
 	msrFile, err := msr.OpenMSR(0)
 	if err != nil {
@@ -49,14 +39,12 @@ func main() {
 	}
 	defer msrFile.Close()
 
-	// Get unit info
 	unitData, err := msrFile.ReadMSR(msr.UNIT_MULTIPLIER)
 	if err != nil {
 		log.Fatalf("Failed to read UNIT_MULTIPLIER MSR: %v", err)
 	}
 	units := parseUnitMSR(unitData)
 	energyUnit := math.Pow(0.5, float64(units.Energy))
-	log.Printf("Energy unit: 1/2^%d Joules (~%f J)", units.Energy, energyUnit)
 
 	domains := []*powerDomain{
 		{name: "Package", msrOffset: msr.PKG_STATUS},
@@ -65,11 +53,11 @@ func main() {
 		{name: "DRAM", msrOffset: msr.DRAM_STATUS},
 	}
 
+	var orderedDomains []string
 	for _, domain := range domains {
 		has, err := msrFile.CheckMSR(domain.msrOffset)
 		if err != nil {
-			log.Printf("Warning: could not check for %s domain: %v", domain.name, err)
-			continue
+			log.Fatalf("Could not check for %s domain: %v", domain.name, err)
 		}
 		domain.hasDomain = has
 		if has {
@@ -78,61 +66,58 @@ func main() {
 				log.Fatalf("Failed to read initial energy for %s: %v", domain.name, err)
 			}
 			domain.lastEnergy = initialEnergy
-			log.Printf("Successfully initialized domain: %s", domain.name)
-		} else {
-			log.Printf("Domain not available: %s", domain.name)
+			orderedDomains = append(orderedDomains, domain.name)
 		}
 	}
 
-	lastTime := time.Now()
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	p := tea.NewProgram(tui.InitialModel(cpuInfo, orderedDomains))
 
-	fmt.Println("\nWatching power consumption... Press Ctrl+C to stop.")
+	// Power Monitoring Goroutine
+	go func() {
+		lastTime := time.Now()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
 
-	for t := range ticker.C {
-		timeElapsed := t.Sub(lastTime).Seconds()
-		if timeElapsed == 0 {
-			continue
-		}
-
-		for _, domain := range domains {
-			if !domain.hasDomain {
+		for {
+			<-ticker.C
+			currentTime := time.Now()
+			timeElapsed := currentTime.Sub(lastTime).Seconds()
+			if timeElapsed == 0 {
 				continue
 			}
 
-			currentEnergy, err := msrFile.ReadMSR(domain.msrOffset)
-			if err != nil {
-				log.Printf("Warning: Failed to read MSR for %s: %v", domain.name, err)
-				continue
+			powerUpdate := make(map[string]float64)
+
+			for _, domain := range domains {
+				if !domain.hasDomain {
+					continue
+				}
+
+				currentEnergy, err := msrFile.ReadMSR(domain.msrOffset)
+				if err != nil {
+					p.Send(tui.ErrorMsg{Err: fmt.Errorf("failed to read MSR for %s: %w", domain.name, err)})
+					return
+				}
+
+				var energyConsumed uint64
+				if currentEnergy < domain.lastEnergy {
+					energyConsumed = (math.MaxUint32 - domain.lastEnergy) + currentEnergy
+				} else {
+					energyConsumed = currentEnergy - domain.lastEnergy
+				}
+
+				powerUpdate[domain.name] = float64(energyConsumed) * energyUnit / timeElapsed
+				domain.lastEnergy = currentEnergy
 			}
 
-			var energyConsumed uint64
-			// Handle 32-bit counter wrap-around
-			if currentEnergy < domain.lastEnergy {
-				energyConsumed = (math.MaxUint32 - domain.lastEnergy) + currentEnergy
-			} else {
-				energyConsumed = currentEnergy - domain.lastEnergy
-			}
-
-			domain.currentPower = float64(energyConsumed) * energyUnit / timeElapsed
-			domain.lastEnergy = currentEnergy
+			p.Send(tui.PowerUpdateMsg{Data: powerUpdate})
+			lastTime = currentTime
 		}
+	}()
 
-		fmt.Print("\033[H\033[2J") // Clear screen
-		fmt.Println("--- CPU Information ---")
-		fmt.Printf("Vendor: %s\n", cpu.VendorString)
-		fmt.Printf("Model:  %s\n", cpu.BrandString)
-		fmt.Println("-----------------------")
-		fmt.Println("--- Current Power Consumption ---")
-		for _, domain := range domains {
-			if domain.hasDomain {
-				fmt.Printf("% -15s: %.2f W\n", domain.name, domain.currentPower)
-			}
-		}
-		fmt.Println("---------------------------------")
-
-		lastTime = t
+	// Run TUI
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Alas, there's been an error: %v\n", err)
+		os.Exit(1)
 	}
 }
-

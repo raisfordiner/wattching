@@ -1,10 +1,11 @@
 # Installation
 
 ```sh
-git clone <repo>
+git clone https://github.com/raisfordiner/wattching.git
 cd wattching
 go mod tidy
 go build -o wattching
+sudo modprobe msr
 sudo ./wattching
 ```
 
